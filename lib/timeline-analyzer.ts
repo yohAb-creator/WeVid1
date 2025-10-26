@@ -263,11 +263,49 @@ Extract core learning topics from this user interest: "${interests}"`
       
       // Step 2: Parse timeline from description
       this.updateProgress('parse_timeline', 10, 'Analyzing video timeline structure...')
-      const segments = this.parseTimelineFromDescription(videoInfo.description)
-      this.updateProgress('parse_timeline', 100, 'Video timeline analyzed', {
-        totalSegments: segments.length,
-        segments: segments.map(s => ({ time: s.startTime, title: s.title }))
-      })
+      let segments = this.parseTimelineFromDescription(videoInfo.description)
+      
+      // Fallback to Python AssemblyAI analysis if no YouTube segments found
+      if (segments.length === 0) {
+        this.updateProgress('parse_timeline', 50, 'No YouTube segments found, using Python AssemblyAI analysis...')
+        
+        try {
+          const pythonResult = await this.analyzeWithPythonBackend(url, interests)
+          segments = pythonResult.segments.map((segment: any) => ({
+            startTime: segment.startTime,
+            endTime: segment.endTime,
+            title: segment.title,
+            description: segment.description
+          }))
+          
+          this.updateProgress('parse_timeline', 100, 'Python AssemblyAI analysis complete', {
+            totalSegments: segments.length,
+            segments: segments.map(s => ({ time: s.startTime, title: s.title })),
+            source: 'assemblyai_python'
+          })
+        } catch (pythonError) {
+          console.error('Python analysis failed, falling back to single segment:', pythonError)
+          // Final fallback: Create a single segment for the entire video
+          segments = [{
+            startTime: '0:00',
+            endTime: videoInfo.duration,
+            title: videoInfo.title,
+            description: 'Full video content - no segments available'
+          }]
+          
+          this.updateProgress('parse_timeline', 100, 'Fallback to single segment', {
+            totalSegments: 1,
+            segments: [{ time: '0:00', title: videoInfo.title }],
+            source: 'fallback'
+          })
+        }
+      } else {
+        this.updateProgress('parse_timeline', 100, 'Video timeline analyzed', {
+          totalSegments: segments.length,
+          segments: segments.map(s => ({ time: s.startTime, title: s.title })),
+          source: 'youtube'
+        })
+      }
       
       // Step 3: Use selected model to analyze relevance with extracted concepts
       this.updateProgress('analyze_relevance', 10, `Matching segments with learning concepts using ${this.selectedModel.toUpperCase()}...`)
@@ -1026,5 +1064,35 @@ Respond in JSON format:
         }
       }
     }
+  }
+
+  /**
+   * Fallback method to analyze video using Python backend when no YouTube segments are found
+   * This method preserves the core functionality by only being called as a fallback
+   */
+  private async analyzeWithPythonBackend(url: string, interests: string): Promise<any> {
+    console.log('Calling Python backend for AssemblyAI analysis...')
+    
+    const response = await fetch('/api/analyze-python', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ url, interests }),
+    })
+    
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Python backend API failed: ${response.status} ${response.statusText} - ${errorText}`)
+    }
+    
+    const result = await response.json()
+    
+    if (!result.success) {
+      throw new Error(result.error || 'Python backend analysis failed')
+    }
+    
+    console.log(`Python backend returned ${result.segments?.length || 0} segments`)
+    return result
   }
 }

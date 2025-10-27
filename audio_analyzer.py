@@ -93,10 +93,11 @@ class AudioAnalyzer:
         # Adjust payload to match AssemblyAI API schema
         data = {
             "audio_url": audio_url,
-            "auto_highlights": True,  # Updated key for highlights
-            "iab_categories": True,  # Enable topic detection
+            "auto_highlights": True,  # Highlights for key moments
+            "auto_chapters": True,  # Chapters for better segmentation
+            "iab_categories": True,  # Topic detection
             "sentiment_analysis": True,
-            "speaker_labels": True  # Enable speaker diarization for better segmentation
+            "speaker_labels": True  # Speaker diarization for better segmentation
         }
 
         # Start transcription
@@ -163,7 +164,27 @@ class AudioAnalyzer:
         
         print("\nExtracting segments from transcript...")
         
-        # Try to get highlights first (auto-highlights feature)
+        # PRIORITY 1: Try to get chapters first (most reliable segmentation)
+        chapters = transcript.get("chapters", [])
+        if chapters:
+            print(f"Found {len(chapters)} chapters")
+            for chapter in chapters:
+                segment = AudioSegment(
+                    start_ms=int(chapter["start"]),
+                    end_ms=int(chapter["end"]),
+                    text=chapter.get("headline", "") or chapter.get("summary", ""),
+                    topics=[],
+                    sentiment="neutral",
+                    confidence=1.0
+                )
+                segments.append(segment)
+        
+        # If chapters created segments, return them
+        if segments:
+            print(f"Created {len(segments)} segments from chapters")
+            return segments
+        
+        # PRIORITY 2: Try to get highlights (auto-highlights feature)
         highlights = transcript.get("auto_highlights_result", {}).get("results", [])
         
         if highlights:

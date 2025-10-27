@@ -11,7 +11,8 @@ interface AnalysisStep {
 }
 
 interface TimelineSegment {
-  time: string
+  time?: string
+  startTime?: string
   title: string
   relevanceScore: number
   reasoning: string
@@ -31,7 +32,8 @@ interface Recommendation {
 export default function Home() {
   const [url, setUrl] = useState('')
   const [interests, setInterests] = useState('')
-  const [model, setModel] = useState<'openai' | 'gemini'>('openai')
+  const [model, setModel] = useState<'openai' | 'gemini'>('gemini')
+  const [useAudioAnalyzer, setUseAudioAnalyzer] = useState(false)
   const [loading, setLoading] = useState(false)
   const [result, setResult] = useState<any>(null)
   const [error, setError] = useState('')
@@ -145,6 +147,7 @@ export default function Home() {
           url,
           interests,
           model,
+          useAudioAnalyzer,
         }),
       })
 
@@ -243,6 +246,29 @@ export default function Home() {
                 />
               </div>
 
+              {/* Audio Analyzer Option */}
+              <div className="bg-amber-50 border border-amber-200 rounded-lg p-4">
+                <div className="flex items-start">
+                  <input
+                    type="checkbox"
+                    id="useAudioAnalyzer"
+                    checked={useAudioAnalyzer}
+                    onChange={(e) => setUseAudioAnalyzer(e.target.checked)}
+                    className="mt-1 h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                  />
+                  <label htmlFor="useAudioAnalyzer" className="ml-3 flex-1">
+                    <span className="block text-sm font-medium text-gray-900">
+                      🎙️ Enable Deep Audio Analysis (Optional)
+                    </span>
+                    <span className="block text-sm text-amber-800 mt-1">
+                      <strong>⚠️ Warning:</strong> This mode uses advanced audio transcription and analysis. 
+                      It provides more detailed insights but <strong>will take significantly longer</strong> (5-15 minutes depending on video length). 
+                      Only enable if the video has no timeline segments in its description.
+                    </span>
+                  </label>
+                </div>
+              </div>
+
               {/* Submit Button */}
               <button
                 type="submit"
@@ -307,6 +333,24 @@ export default function Home() {
           {/* Results Display */}
           {result && result.success && (
             <div className="space-y-8">
+              {/* Main Video Player */}
+              {videoId && (
+                <div className="bg-white rounded-2xl shadow-xl p-8">
+                  <h3 className="text-xl font-semibold text-gray-800 mb-4">📺 Video Player</h3>
+                  <div className="aspect-video rounded-lg overflow-hidden">
+                    <iframe
+                      ref={videoRef}
+                      src={`https://www.youtube.com/embed/${videoId}?start=0`}
+                      title="Video player"
+                      frameBorder="0"
+                      allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
+                      allowFullScreen
+                      className="w-full h-full"
+                    ></iframe>
+                  </div>
+                  <p className="text-sm text-gray-600 mt-2">Click on any timeline segment below to jump to that part of the video</p>
+                </div>
+              )}
               {/* User Interests & Keywords */}
               {result.analysisDetails && (
                 <div className="bg-white rounded-2xl shadow-xl p-8">
@@ -475,7 +519,9 @@ export default function Home() {
                         } ${selectedSegment === segment ? 'ring-2 ring-blue-500' : ''}`}
                         onClick={() => {
                           setSelectedSegment(segment)
-                          jumpToTime(segment.time)
+                          const timeStr = segment.time || segment.startTime || '0:00'
+                          console.log('Jumping to time:', timeStr)
+                          jumpToTime(timeStr)
                         }}
                       >
                         <div className="flex items-center gap-2 mb-2">
@@ -483,10 +529,12 @@ export default function Home() {
                             className="text-xs font-medium text-blue-600 bg-blue-100 px-2 py-1 rounded-full hover:bg-blue-200 transition-colors"
                             onClick={(e) => {
                               e.stopPropagation()
-                              jumpToTime(segment.time)
+                              const timeStr = segment.time || segment.startTime || '0:00'
+                              console.log('Button click - jumping to:', timeStr)
+                              jumpToTime(timeStr)
                             }}
                           >
-                            ▶️ {segment.time}
+                            ▶️ {segment.time || segment.startTime}
                           </button>
                           <span className={`text-xs font-bold px-2 py-1 rounded-full ${
                             segment.relevanceScore >= 70 ? 'bg-green-100 text-green-800' : 

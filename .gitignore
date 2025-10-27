@@ -36,3 +36,6 @@ next-env.d.ts
 # Temporary files
 *.tmp
 *.temp
+
+# Cookies (contains sensitive authentication data)
+cookies.txt

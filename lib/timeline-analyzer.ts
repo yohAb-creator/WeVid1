@@ -30,6 +30,11 @@ export interface TimelineAnalysisResult {
   processingTime: number
   userInterests: string
   extractedKeywords: string[]
+  source: 'youtube' | 'assemblyai_python' | 'llm_fallback' | 'fallback'
+  audioAnalyzerData?: {
+    segments: any[]
+    processingTime: number
+  }
 }
 
 export interface ProgressUpdate {
@@ -240,10 +245,12 @@ Extract core learning topics from this user interest: "${interests}"`
     return uniqueConcepts
   }
 
-  async analyzeVideo(url: string, interests: string): Promise<TimelineAnalysisResult> {
+  async analyzeVideo(url: string, interests: string, useAudioAnalyzer: boolean = false): Promise<TimelineAnalysisResult> {
     const startTime = Date.now()
     
     try {
+      console.log('Starting analyzeVideo with:', { url, interests, useAudioAnalyzer, model: this.selectedModel })
+      
       // Extract learning concepts from user interests using LLM
       this.updateProgress('keyword_extraction', 10, `Extracting learning concepts with ${this.selectedModel.toUpperCase()}...`)
       const extractedKeywords = await this.extractKeywordsWithLLM(interests)
@@ -264,40 +271,139 @@ Extract core learning topics from this user interest: "${interests}"`
       // Step 2: Parse timeline from description
       this.updateProgress('parse_timeline', 10, 'Analyzing video timeline structure...')
       let segments = this.parseTimelineFromDescription(videoInfo.description)
+      let timelineSource: 'youtube' | 'assemblyai_python' | 'llm_fallback' | 'fallback' = 'youtube'
+      let audioAnalyzerData: { segments: any[], processingTime: number } | undefined = undefined
       
-      // Fallback to Python AssemblyAI analysis if no YouTube segments found
+      // Fallback to Python AssemblyAI analysis with timeout and LLM fallback
       if (segments.length === 0) {
-        this.updateProgress('parse_timeline', 50, 'No YouTube segments found, using Python AssemblyAI analysis...')
-        
-        try {
-          const pythonResult = await this.analyzeWithPythonBackend(url, interests)
-          segments = pythonResult.segments.map((segment: any) => ({
-            startTime: segment.startTime,
-            endTime: segment.endTime,
-            title: segment.title,
-            description: segment.description
-          }))
+        if (useAudioAnalyzer) {
+          this.updateProgress('parse_timeline', 50, 'No YouTube segments found, starting audio analysis...')
           
-          this.updateProgress('parse_timeline', 100, 'Python AssemblyAI analysis complete', {
-            totalSegments: segments.length,
-            segments: segments.map(s => ({ time: s.startTime, title: s.title })),
-            source: 'assemblyai_python'
-          })
-        } catch (pythonError) {
-          console.error('Python analysis failed, falling back to single segment:', pythonError)
-          // Final fallback: Create a single segment for the entire video
-          segments = [{
-            startTime: '0:00',
-            endTime: videoInfo.duration,
-            title: videoInfo.title,
-            description: 'Full video content - no segments available'
-          }]
+          try {
+            // Try AudioAnalyzer with 60-minute timeout (audio analysis can take 30+ minutes)
+            const analysisPromise = this.analyzeWithPythonBackend(url, interests)
+            const timeoutPromise = new Promise((_, reject) => 
+              setTimeout(() => reject(new Error('Audio analysis timed out after 60 minutes')), 3600000)
+            )
+            
+            const pythonResult = await Promise.race([analysisPromise, timeoutPromise]) as any
+            
+            // Check if we got actual segments (not just single "entire video")
+            const hasMultipleSegments = pythonResult.segments && pythonResult.segments.length > 1
+            
+            if (hasMultipleSegments) {
+              // Store AudioAnalyzer data for later use
+              audioAnalyzerData = {
+                segments: pythonResult.segments,
+                processingTime: pythonResult.processingTime || 0
+              }
+              
+              // Convert to timeline format but keep original AudioAnalyzer data
+              segments = pythonResult.segments.map((segment: any) => ({
+                startTime: segment.startTime,
+                endTime: segment.endTime,
+                title: segment.title,
+                description: segment.description
+              }))
+              
+              timelineSource = 'assemblyai_python'
+              
+              this.updateProgress('parse_timeline', 100, 'Python AssemblyAI analysis complete', {
+                totalSegments: segments.length,
+                segments: segments.map(s => ({ time: s.startTime, title: s.title })),
+                source: 'assemblyai_python'
+              })
+            } else {
+              // AudioAnalyzer returned single segment, use LLM fallback
+              throw new Error('AudioAnalyzer returned single segment, using LLM fallback')
+            }
+          } catch (pythonError) {
+            console.error('Audio analysis failed or timed out, trying to get transcript for LLM:', pythonError)
+            
+            try {
+              // NEW: Get transcript directly from AssemblyAI for LLM analysis
+              this.updateProgress('parse_timeline', 70, 'Getting transcript from AssemblyAI for LLM analysis...')
+              const transcript = await this.getTranscriptFromAudio(url)
+              
+              // Use LLM to create segments from the transcript
+              this.updateProgress('parse_timeline', 80, 'Using LLM to analyze transcript and create segments...')
+              segments = await this.generateSegmentsWithLLMFromTranscript(videoInfo, interests, extractedKeywords, transcript)
+              timelineSource = 'llm_fallback'
+              
+              this.updateProgress('parse_timeline', 100, 'LLM-generated segments from transcript ready', {
+                totalSegments: segments.length,
+                segments: segments.map(s => ({ time: s.startTime, title: s.title })),
+                source: 'llm_fallback'
+              })
+            } catch (transcriptError) {
+              console.error('Failed to get transcript or LLM analysis failed, using description-only:', transcriptError)
+              
+              try {
+                // Fallback to description-only LLM analysis
+                this.updateProgress('parse_timeline', 75, 'Using LLM to generate segments from video description...')
+                segments = await this.generateSegmentsWithLLM(videoInfo, interests, extractedKeywords)
+                timelineSource = 'llm_fallback'
+                
+                this.updateProgress('parse_timeline', 100, 'LLM-generated segments ready', {
+                  totalSegments: segments.length,
+                  segments: segments.map(s => ({ time: s.startTime, title: s.title })),
+                  source: 'llm_fallback'
+                })
+              } catch (llmError) {
+                console.error('LLM segment generation also failed, using single segment:', llmError)
+                
+                // Final fallback: Create a single segment for the entire video
+                segments = [{
+                  startTime: '0:00',
+                  endTime: videoInfo.duration,
+                  title: videoInfo.title,
+                  description: 'Full video content - no segments available'
+                }]
+                
+                timelineSource = 'fallback'
+                
+                this.updateProgress('parse_timeline', 100, 'Fallback to single segment', {
+                  totalSegments: 1,
+                  segments: [{ time: '0:00', title: videoInfo.title }],
+                  source: 'fallback'
+                })
+              }
+            }
+          }
+        } else {
+          // Audio analyzer not enabled, skip directly to LLM fallback
+          this.updateProgress('parse_timeline', 50, 'No YouTube segments found, using LLM to generate segments...')
           
-          this.updateProgress('parse_timeline', 100, 'Fallback to single segment', {
-            totalSegments: 1,
-            segments: [{ time: '0:00', title: videoInfo.title }],
-            source: 'fallback'
-          })
+          try {
+            // Fallback to description-only LLM analysis
+            this.updateProgress('parse_timeline', 75, 'Using LLM to generate segments from video description...')
+            segments = await this.generateSegmentsWithLLM(videoInfo, interests, extractedKeywords)
+            timelineSource = 'llm_fallback'
+            
+            this.updateProgress('parse_timeline', 100, 'LLM-generated segments ready', {
+              totalSegments: segments.length,
+              segments: segments.map(s => ({ time: s.startTime, title: s.title })),
+              source: 'llm_fallback'
+            })
+          } catch (llmError) {
+            console.error('LLM segment generation failed, using single segment:', llmError)
+            
+            // Final fallback: Create a single segment for the entire video
+            segments = [{
+              startTime: '0:00',
+              endTime: videoInfo.duration,
+              title: videoInfo.title,
+              description: 'Full video content - no segments available'
+            }]
+            
+            timelineSource = 'fallback'
+            
+            this.updateProgress('parse_timeline', 100, 'Fallback to single segment', {
+              totalSegments: 1,
+              segments: [{ time: '0:00', title: videoInfo.title }],
+              source: 'fallback'
+            })
+          }
         }
       } else {
         this.updateProgress('parse_timeline', 100, 'Video timeline analyzed', {
@@ -322,7 +428,7 @@ Extract core learning topics from this user interest: "${interests}"`
       // Step 4: Filter most relevant segments
       this.updateProgress('filter_segments', 10, 'Selecting most relevant video segments...')
       const relevantSegments = analyzedSegments
-        .filter(segment => segment.relevanceScore >= 40) // Lowered threshold to catch RLHF segment
+        .filter(segment => segment.relevanceScore >= 25) // Lowered threshold to be more inclusive
         .sort((a, b) => b.relevanceScore - a.relevanceScore)
         .slice(0, 3) // Top 3 most relevant segments
       
@@ -343,7 +449,9 @@ Extract core learning topics from this user interest: "${interests}"`
         relevantSegments,
         processingTime: Date.now() - startTime,
         userInterests: interests,
-        extractedKeywords
+        extractedKeywords,
+        source: timelineSource,
+        audioAnalyzerData: audioAnalyzerData
       }
     } catch (error: any) {
       console.error('Timeline analysis failed:', error)
@@ -354,11 +462,30 @@ Extract core learning topics from this user interest: "${interests}"`
 
   private async extractVideoInfo(url: string): Promise<any> {
     return new Promise((resolve, reject) => {
-      const ytdlp = spawn('yt-dlp', [
+      // Check if cookies file exists
+      const cookiesPath = path.join(process.cwd(), 'cookies.txt')
+      const args = [
         '--dump-json',
         '--no-download',
-        url
-      ])
+        '--no-check-certificate',
+        '--user-agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      ]
+      
+      // Add cookies if file exists
+      try {
+        if (require('fs').existsSync(cookiesPath)) {
+          args.push('--cookies', cookiesPath)
+          console.log('Using cookies from:', cookiesPath)
+        } else {
+          console.log('No cookies.txt found, proceeding without cookies')
+        }
+      } catch (e) {
+        console.log('Could not check for cookies file:', e)
+      }
+      
+      args.push(url)
+      
+      const ytdlp = spawn('yt-dlp', args)
 
       let output = ''
       let errorOutput = ''
@@ -385,7 +512,12 @@ Extract core learning topics from this user interest: "${interests}"`
             reject(new Error(`Failed to parse video info: ${parseError}`))
           }
         } else {
-          reject(new Error(`yt-dlp failed with code ${code}: ${errorOutput}`))
+          // Check for specific YouTube bot detection error
+          if (errorOutput.includes('Sign in to confirm') || errorOutput.includes('not a bot')) {
+            reject(new Error(`YouTube bot detection triggered. Please update yt-dlp: run 'yt-dlp -U' or 'pip install --upgrade yt-dlp'`))
+          } else {
+            reject(new Error(`yt-dlp failed with code ${code}: ${errorOutput}`))
+          }
         }
       })
     })
@@ -394,28 +526,57 @@ Extract core learning topics from this user interest: "${interests}"`
   private parseTimelineFromDescription(description: string): TimelineSegment[] {
     const segments: TimelineSegment[] = []
     
-    // Look for timeline patterns like "(00:00) Introduction", "(15:20) Topic", etc.
-    const timelineRegex = /\((\d{1,2}:\d{2})\)\s*([^\n]+)/g
-    let match
+    // Try multiple timestamp patterns
+    const patterns = [
+      // Pattern with start-end range: "0:00:00 - 0:04:18 Title"
+      /(\d{1,2}:\d{2}(?::\d{2})?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?)\s+(.+?)(?=\n|$)/g,
+      // (0:00) or (0:00:00)
+      /\((\d{1,2}:\d{2}(?::\d{2})?)\)\s*([^\n]+)/g,
+      // [0:00] or [0:00:00]
+      /\[(\d{1,2}:\d{2}(?::\d{2})?)\]\s*([^\n]+)/g,
+      // 0:00 Title (at line start)
+      /^(\d{1,2}:\d{2}(?::\d{2})?)\s+([^\n]+)/gm,
+      // \n0:00 Title
+      /\n(\d{1,2}:\d{2}(?::\d{2})?)\s+([^\n]+)/g
+    ]
     
-    while ((match = timelineRegex.exec(description)) !== null) {
-      const startTime = match[1]
-      const title = match[2].trim()
-      
-      // Try to find the next timestamp to determine end time
-      const nextMatch = timelineRegex.exec(description)
-      const endTime = nextMatch ? nextMatch[1] : null
-      
-      // Reset regex position for next iteration
-      timelineRegex.lastIndex = match.index + 1
-      
-      segments.push({
-        startTime,
-        endTime: endTime || this.calculateEndTime(startTime, segments),
-        title
-      })
+    for (const pattern of patterns) {
+      const matches = Array.from(description.matchAll(pattern))
+      if (matches.length > 0) {
+        console.log(`Found ${matches.length} timestamps with pattern: ${pattern}`)
+        
+        // Check if this is the range pattern (has 3 capture groups)
+        const isRangePattern = matches[0].length === 4 // [fullMatch, start, end, title]
+        
+        for (let i = 0; i < matches.length; i++) {
+          const match = matches[i]
+          
+          if (isRangePattern) {
+            // Format: "0:00:00 - 0:04:18 Title"
+            segments.push({
+              startTime: match[1],
+              endTime: match[2],
+              title: match[3].trim()
+            })
+          } else {
+            // Format: "0:00 Title" (calculate end time from next segment)
+            const startTime = match[1]
+            const title = match[2].trim()
+            const nextMatch = matches[i + 1]
+            const endTime = nextMatch ? nextMatch[1] : null
+            
+            segments.push({
+              startTime,
+              endTime: endTime || this.calculateEndTime(startTime, segments),
+              title
+            })
+          }
+        }
+        break // Use first pattern that finds segments
+      }
     }
     
+    console.log(`Parsed ${segments.length} timeline segments from description`)
     return segments
   }
 
@@ -636,7 +797,7 @@ Respond in JSON format:
         // Semantic variations and related terms
         const semanticMatches = this.getSemanticMatches(topicLower, segmentText)
         if (semanticMatches.length > 0) {
-          score += semanticMatches.length * 15
+          score += semanticMatches.length * 20  // Increased from 15 to 20
           matchedConcepts.push(...semanticMatches)
           reasoning += `Semantic match with ${topic}: ${semanticMatches.join(', ')}. `
           console.log(`  ✓ Semantic matches for ${topic}: ${semanticMatches.join(', ')}`)
@@ -674,6 +835,7 @@ Respond in JSON format:
 
   private getSemanticMatches(topic: string, segmentText: string): string[] {
     const semanticMap: { [key: string]: string[] } = {
+      // AI/ML terms
       'llm reasoning': ['reasoning', 'thinking', 'cognition', 'inference', 'logic', 'chain of thought', 'step-by-step'],
       'post-training techniques': ['fine-tuning', 'alignment', 'rlhf', 'reinforcement learning', 'human feedback', 'post-training', 'training'],
       'machine learning': ['ml', 'ai', 'artificial intelligence', 'neural networks', 'deep learning', 'algorithms', 'models'],
@@ -683,7 +845,14 @@ Respond in JSON format:
       'computer vision': ['vision', 'image', 'visual', 'cnn', 'detection', 'recognition', 'computer vision'],
       'artificial intelligence': ['ai', 'artificial intelligence', 'machine learning', 'neural networks', 'intelligence'],
       'data science': ['data', 'analytics', 'statistics', 'analysis', 'insights', 'data science'],
-      'software engineering': ['engineering', 'development', 'programming', 'coding', 'software', 'engineering']
+      'software engineering': ['engineering', 'development', 'programming', 'coding', 'software', 'engineering'],
+      // Health/Fitness/Wellness terms
+      'fitness': ['wellness', 'health', 'exercise', 'workout', 'training', 'physical', 'body', 'nutrition', 'diet', 'influencer', 'healthy'],
+      'health': ['wellness', 'fitness', 'medical', 'healthcare', 'healthy', 'medicine', 'doctor', 'nutrition', 'diet', 'body'],
+      'wellness': ['health', 'fitness', 'wellbeing', 'healthy', 'holistic', 'lifestyle', 'self-care', 'mental health'],
+      'nutrition': ['diet', 'food', 'eating', 'nutrients', 'health', 'wellness', 'supplements', 'vitamins'],
+      'exercise': ['workout', 'training', 'fitness', 'physical', 'movement', 'gym', 'sports', 'activity'],
+      'diet': ['nutrition', 'food', 'eating', 'health', 'weight', 'calories', 'meal', 'fasting']
     }
     
     const variations = semanticMap[topic] || []
@@ -871,68 +1040,22 @@ Respond in JSON format:
       } catch (error) {
         console.error(`Failed to transcribe ${audioPath}:`, error)
         
-        // Fallback to realistic mock transcript that demonstrates AssemblyAI features
-        const mockTranscript = {
-          text: `So when we talk about post-training techniques, we're really discussing how we can take a pre-trained language model and fine-tune it for specific tasks. This is crucial for making AI systems more helpful and safe. The key difference between pre-training and post-training is that pre-training gives the model general language understanding, while post-training focuses on alignment with human preferences through techniques like reinforcement learning from human feedback.`,
-          utterances: [
-            { start: 0, end: 8000, text: "So when we talk about post-training techniques, we're really discussing how we can take a pre-trained language model and fine-tune it for specific tasks.", speaker: "Speaker A" },
-            { start: 8000, end: 12000, text: "This is crucial for making AI systems more helpful and safe.", speaker: "Speaker A" },
-            { start: 12000, end: 18000, text: "The key difference between pre-training and post-training is that pre-training gives the model general language understanding, while post-training focuses on alignment with human preferences through techniques like reinforcement learning from human feedback.", speaker: "Speaker A" }
-          ],
-          summary: "This segment covers post-training techniques, AI alignment, and reinforcement learning from human feedback.",
-          confidence: 0.95,
-          words: [
-            { text: "post-training", start: 1000, end: 2000, confidence: 0.98 },
-            { text: "techniques", start: 2000, end: 3000, confidence: 0.97 },
-            { text: "language", start: 4000, end: 5000, confidence: 0.96 },
-            { text: "model", start: 5000, end: 6000, confidence: 0.95 },
-            { text: "reinforcement", start: 15000, end: 16000, confidence: 0.94 },
-            { text: "learning", start: 16000, end: 17000, confidence: 0.93 }
-          ],
-          auto_highlights_result: {
-            results: [
-              { text: "post-training techniques", start: 1000, end: 3000, confidence: 0.98 },
-              { text: "reinforcement learning from human feedback", start: 15000, end: 18000, confidence: 0.95 },
-              { text: "AI alignment", start: 8000, end: 10000, confidence: 0.92 }
-            ]
-          },
-          sentiment_analysis_results: [
-            { text: "This is crucial for making AI systems more helpful and safe.", start: 8000, end: 12000, sentiment: "POSITIVE", confidence: 0.89 }
-          ],
-          entities: [
-            { text: "AI systems", start: 9000, end: 10000, entity_type: "TECHNOLOGY", confidence: 0.94 },
-            { text: "language model", start: 4000, end: 6000, entity_type: "TECHNOLOGY", confidence: 0.96 },
-            { text: "reinforcement learning", start: 15000, end: 17000, entity_type: "TECHNOLOGY", confidence: 0.93 }
-          ],
-          iab_categories_result: {
-            results: [
-              { label: "Technology", confidence: 0.95 },
-              { label: "Artificial Intelligence", confidence: 0.92 },
-              { label: "Machine Learning", confidence: 0.88 }
-            ]
-          },
-          auto_chapters_result: {
-            chapters: [
-              { headline: "Introduction to Post-Training", start: 0, end: 8000 },
-              { headline: "AI Safety and Alignment", start: 8000, end: 12000 },
-              { headline: "Pre-training vs Post-training", start: 12000, end: 18000 }
-            ]
-          }
-        }
+        // Push error information instead of mock data
         transcripts.push({
-          text: mockTranscript.text,
-          utterances: mockTranscript.utterances,
-          summary: this.generateTranscriptSummary(mockTranscript),
-          confidence: mockTranscript.confidence,
-          words: mockTranscript.words,
-          auto_highlights_result: mockTranscript.auto_highlights_result,
-          sentiment_analysis_results: mockTranscript.sentiment_analysis_results,
-          entities: mockTranscript.entities,
-          iab_categories_result: mockTranscript.iab_categories_result,
-          auto_chapters_result: mockTranscript.auto_chapters_result,
-          assemblyai_summary: mockTranscript.summary
+          text: 'Transcription failed - unable to process audio',
+          utterances: [],
+          summary: 'Audio transcription failed. Please try again or check your AssemblyAI API key.',
+          confidence: 0,
+          words: [],
+          auto_highlights_result: null,
+          sentiment_analysis_results: [],
+          entities: [],
+          iab_categories_result: null,
+          auto_chapters_result: null,
+          assemblyai_summary: null,
+          error: error instanceof Error ? error.message : 'Unknown error'
         })
-        console.log(`Using mock transcript for: ${audioPath}`)
+        console.log(`Transcription failed for: ${audioPath}`)
       }
     }
     
@@ -1094,5 +1217,265 @@ Respond in JSON format:
     
     console.log(`Python backend returned ${result.segments?.length || 0} segments`)
     return result
+  }
+
+  /**
+   * Generate segments using LLM when audio analysis fails or times out
+   */
+  private async generateSegmentsWithLLM(
+    videoInfo: any, 
+    interests: string, 
+    keywords: string[]
+  ): Promise<TimelineSegment[]> {
+    
+    const durationSeconds = this.parseDurationToSeconds(videoInfo.duration)
+    const prompt = `You are analyzing a YouTube video to create intelligent segments.
+
+Video Title: ${videoInfo.title}
+Video Duration: ${videoInfo.duration}
+Video Description: ${videoInfo.description?.substring(0, 500) || 'No description available'}
+
+User Interests: ${interests}
+Key Topics: ${keywords.join(', ')}
+
+Based on the video information above, create 5-8 intelligent segments that would be useful for learning about the user's interests.
+
+Rules:
+- Each segment should be 2-5 minutes long
+- Start times must be in MM:SS format
+- End times must be in MM:SS format  
+- Segments should be logically related to the video content
+- Focus on segments relevant to the user's interests
+- Total duration should not exceed video duration (${videoInfo.duration})
+
+Respond in JSON format:
+{
+  "segments": [
+    {
+      "startTime": "0:00",
+      "endTime": "3:45",
+      "title": "Introduction to Topic X",
+      "description": "Brief overview of the key concepts"
+    }
+  ]
+}`
+
+    try {
+      if (this.selectedModel === 'gemini') {
+        const model = this.gemini.getGenerativeModel({ model: "gemini-pro" })
+        const result = await model.generateContent(prompt)
+        const response = result.response.text()
+        
+        // Extract JSON from response
+        const jsonMatch = response.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          const data = JSON.parse(jsonMatch[0])
+          return data.segments || []
+        }
+      } else {
+        const completion = await this.openai.chat.completions.create({
+          model: "gpt-3.5-turbo",
+          messages: [
+            { role: "system", content: "You are an expert at analyzing educational video content. Always respond with valid JSON." },
+            { role: "user", content: prompt }
+          ],
+          temperature: 0.7,
+          max_tokens: 2000
+        })
+        
+        const responseText = completion.choices[0]?.message?.content || ''
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          const data = JSON.parse(jsonMatch[0])
+          return data.segments || []
+        }
+      }
+      
+      throw new Error('Failed to parse LLM response')
+    } catch (error) {
+      console.error('LLM segment generation failed:', error)
+      throw error
+    }
+  }
+
+  private parseDurationToSeconds(duration: string): number {
+    const parts = duration.split(':').map(Number)
+    if (parts.length === 3) {
+      return parts[0] * 3600 + parts[1] * 60 + parts[2]
+    } else if (parts.length === 2) {
+      return parts[0] * 60 + parts[1]
+    }
+    return 0
+  }
+
+  /**
+   * Get transcript from AssemblyAI for LLM analysis when AudioAnalyzer fails
+   */
+  private async getTranscriptFromAudio(url: string): Promise<string> {
+    console.log('Getting transcript from AssemblyAI for LLM analysis...')
+    
+    try {
+      // Download audio (faster quality for just getting transcript)
+      const audioPath = await this.downloadAudioForTranscript(url)
+      
+      // Upload to AssemblyAI
+      const audioUrl = await this.assemblyAI.files.upload(audioPath)
+      
+      // Transcribe with minimal config (just get text, faster)
+      const config = {
+        audio_url: audioUrl,
+        summarization: true,
+        summary_type: 'bullets' as const
+      }
+      
+      const transcript = await this.assemblyAI.transcripts.transcribe(config)
+      
+      // Wait for completion
+      let attempts = 0
+      const maxAttempts = 30
+      
+      while (transcript.status !== 'completed' && transcript.status !== 'error' && attempts < maxAttempts) {
+        await new Promise(resolve => setTimeout(resolve, 2000))
+        const updatedTranscript = await this.assemblyAI.transcripts.get(transcript.id)
+        Object.assign(transcript, updatedTranscript)
+        attempts++
+      }
+      
+      if (transcript.status === 'error') {
+        throw new Error(`AssemblyAI transcription failed: ${transcript.error}`)
+      }
+      
+      // Clean up
+      await this.cleanup([audioPath])
+      
+      // Return transcript text (first 5000 chars for LLM)
+      return transcript.text?.substring(0, 5000) || ''
+    } catch (error) {
+      console.error('Failed to get transcript from audio:', error)
+      throw error
+    }
+  }
+
+  private async downloadAudioForTranscript(url: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const tempDir = os.tmpdir()
+      const outputPath = path.join(tempDir, `audio_transcript_${Date.now()}.mp3`)
+      
+      // Check if cookies file exists
+      const cookiesPath = path.join(process.cwd(), 'cookies.txt')
+      const args = [
+        '--extract-audio',
+        '--audio-format', 'mp3',
+        '--audio-quality', '64K',  // Lower quality for faster download
+        '--output', outputPath,
+      ]
+      
+      // Add cookies if file exists
+      try {
+        if (require('fs').existsSync(cookiesPath)) {
+          args.push('--cookies', cookiesPath)
+        }
+      } catch (e) {
+        // Ignore
+      }
+      
+      args.push(url)
+      
+      const ytdlp = spawn('yt-dlp', args)
+      
+      ytdlp.on('close', (code) => {
+        if (code === 0) {
+          resolve(outputPath)
+        } else {
+          reject(new Error(`yt-dlp failed with code ${code}`))
+        }
+      })
+      
+      ytdlp.on('error', (error) => {
+        reject(error)
+      })
+    })
+  }
+
+  /**
+   * Generate segments using LLM from transcript when AudioAnalyzer fails
+   */
+  private async generateSegmentsWithLLMFromTranscript(
+    videoInfo: any,
+    interests: string,
+    keywords: string[],
+    transcript: string
+  ): Promise<TimelineSegment[]> {
+    
+    const durationSeconds = this.parseDurationToSeconds(videoInfo.duration)
+    
+    const prompt = `You are analyzing a YouTube video transcript to create intelligent segments.
+
+Video Title: ${videoInfo.title}
+Video Duration: ${videoInfo.duration}
+User Interests: ${interests}
+Key Topics: ${keywords.join(', ')}
+
+TRANSCRIPT:
+${transcript}
+
+Based on the transcript above, create 5-8 intelligent segments that would be useful for learning about the user's interests.
+
+Rules:
+- Analyze the transcript content to understand what's being discussed
+- Each segment should be 2-5 minutes long
+- Start times must be in MM:SS format
+- End times must be in MM:SS format
+- Segments should cover different topics discussed in the video
+- Focus on segments relevant to the user's interests
+- Total duration should not exceed video duration (${videoInfo.duration})
+
+Respond in JSON format:
+{
+  "segments": [
+    {
+      "startTime": "0:00",
+      "endTime": "3:45",
+      "title": "Introduction to Topic X",
+      "description": "Brief overview of the key concepts"
+    }
+  ]
+}`
+
+    try {
+      if (this.selectedModel === 'gemini') {
+        const model = this.gemini.getGenerativeModel({ model: "gemini-pro" })
+        const result = await model.generateContent(prompt)
+        const response = result.response.text()
+        
+        const jsonMatch = response.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          const data = JSON.parse(jsonMatch[0])
+          return data.segments || []
+        }
+      } else {
+        const completion = await this.openai.chat.completions.create({
+          model: "gpt-3.5-turbo",
+          messages: [
+            { role: "system", content: "You are an expert at analyzing educational video content. Always respond with valid JSON." },
+            { role: "user", content: prompt }
+          ],
+          temperature: 0.7,
+          max_tokens: 3000
+        })
+        
+        const responseText = completion.choices[0]?.message?.content || ''
+        const jsonMatch = responseText.match(/\{[\s\S]*\}/)
+        if (jsonMatch) {
+          const data = JSON.parse(jsonMatch[0])
+          return data.segments || []
+        }
+      }
+      
+      throw new Error('Failed to parse LLM response')
+    } catch (error) {
+      console.error('LLM segment generation from transcript failed:', error)
+      throw error
+    }
   }
 }
